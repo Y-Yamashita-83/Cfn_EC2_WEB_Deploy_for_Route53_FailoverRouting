@@ -1,0 +1,574 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: EC2 WEB Server Deploy for Route53 Failover Routing
+
+#=========================================================================================
+# Input Parameters
+#=========================================================================================
+Parameters:
+  KeyName:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+  ClientIP:
+    Description: Client IP Address
+    Type: String
+    Default: 0.0.0.0/0
+  EnvironmentType: 
+    Description: The environment type
+    Type: String
+    Default: test
+    AllowedValues: 
+      - prod
+      - test
+    ConstraintDescription: must be a prod or test
+
+
+#=========================================================================================
+# Mappings
+#=========================================================================================
+Mappings: 
+  RegionAndAMIID: 
+    ap-northeast-1: 
+      test: "ami-0701e21c502689c31"
+      prod: "ami-0bccc42bba4dedac1"
+  RegionAndInstanceType: 
+    ap-northeast-1: 
+      test: "t2.micro"
+      prod: "t3.micro"
+  RegionAndTagValue:
+    ap-northeast-1:
+      test: "EC2-WEB-deploy for Test"
+      prod: "EC2-WEB-deploy for Prod"
+
+
+Resources:
+#=========================================================================================
+# VPC
+#=========================================================================================
+# VPC Create
+  VPC1:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.100.0.0/16
+      InstanceTenancy: default
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+
+# InternetGateway Create
+  VPC1IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties: 
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+
+# InternetGateway Attach
+  VPC1IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: 
+      InternetGatewayId: !Ref VPC1IGW
+      VpcId: !Ref VPC1
+
+
+#=========================================================================================
+# Subnet
+#=========================================================================================
+# PublicSubnet Create
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.100.0.0/24
+      VpcId: !Ref VPC1
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+
+# PrivateSubnet Create
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 10.100.100.0/24
+      VpcId: !Ref VPC1
+      AvailabilityZone: !Select [ 0, !GetAZs ]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+
+
+#=========================================================================================
+# NatGateway
+#=========================================================================================
+# EIP Create
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+# NatGateway Create
+  VPC1NatGW:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+
+
+#=========================================================================================
+# RouteTable
+#=========================================================================================
+# PublicRouteTable1 Create
+  PublicRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC1
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+  
+# PrivateRouteTable1 Create
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC1
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+
+
+#=========================================================================================
+# Routing
+#=========================================================================================
+# PublicRoute1 Create
+  PublicRoute1:
+    Type: AWS::EC2::Route
+    DependsOn: VPC1IGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref VPC1IGW
+
+# PrivateRoute1 Create
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    DependsOn: VPC1NatGW
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref VPC1NatGW
+
+
+#=========================================================================================
+# RoutRouteTable Associate
+#=========================================================================================
+# PublicSubnet1 Associate
+  PublicSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable1
+
+# PrivateSubnet1 Associate
+  PrivateSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+
+#=========================================================================================
+# EC2
+#=========================================================================================
+# Bastion Create
+  Bastion:
+    Type: AWS::EC2::Instance
+    Metadata:
+      Comment: Install Apache & Create HTML File
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            /home/ec2-user/curlrepeat.sh:
+              content: |
+                #!/bin/bash
+                
+                for ((i=1; i<=100; i++))
+                do
+                  curl -s http://www.example.com/index.html | grep -o "EC2." >> ./curlresult
+                  sleep 10
+                done
+                
+                cat ./curlresult | sort | uniq -c
+                
+                echo "curl done!!"
+              mode: '000755'
+              owner: ec2-user
+              group: ec2-user
+    Properties:
+      ImageId: !FindInMap [RegionAndAMIID, !Ref "AWS::Region", !Ref EnvironmentType]
+      InstanceType: !FindInMap [RegionAndInstanceType, !Ref "AWS::Region", !Ref EnvironmentType]
+      KeyName: !Ref KeyName
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: true
+          GroupSet: 
+            - !Ref InstanceSecurityGroup1
+          DeviceIndex: 0
+          SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          sed -i.old -e 's/#Port 22/Port 51512/g' /etc/ssh/sshd_config
+          systemctl restart sshd
+
+          /opt/aws/bin/cfn-init -v \
+          --stack ${AWS::StackName} \
+          --resource Bastion \
+          --region ${AWS::Region}
+          
+          /opt/aws/bin/cfn-signal -e $? \
+          --stack ${AWS::StackName} \
+          --resource Bastion \
+          --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT5M
+
+
+# EC2A Create
+  EC2A:
+    Type: AWS::EC2::Instance
+    Metadata:
+      Comment: Install Apache & Create HTML File
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              httpd: []
+          files:
+            /var/www/html/index.html:
+              content: |
+                <!DOCTYPE html>
+                <html>
+                  <head>
+                    <meta charset="utf-8">
+                  </head>
+                  <body>
+                    <p>EC2A</p>
+                  </body>
+                </html>
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+    Properties:
+      ImageId: !FindInMap [RegionAndAMIID, !Ref "AWS::Region", !Ref EnvironmentType]
+      InstanceType: !FindInMap [RegionAndInstanceType, !Ref "AWS::Region", !Ref EnvironmentType]
+      KeyName: !Ref KeyName
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: false
+          GroupSet: 
+            - !Ref InstanceSecurityGroup2
+          DeviceIndex: 0
+          SubnetId: !Ref PrivateSubnet1
+          PrivateIpAddress: 10.100.100.4
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          sed -i.old -e 's/#Port 22/Port 51512/g' /etc/ssh/sshd_config
+          systemctl restart sshd
+
+          /opt/aws/bin/cfn-init -v \
+          --stack ${AWS::StackName} \
+          --resource EC2A \
+          --region ${AWS::Region}
+          
+          /opt/aws/bin/cfn-signal -e $? \
+          --stack ${AWS::StackName} \
+          --resource EC2A \
+          --region ${AWS::Region}
+
+          sed -i.old -e "s/#ServerName www.example.com:80/ServerName www.example.com:80/g" /etc/httpd/conf/httpd.conf
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+
+
+# EC2B Create
+  EC2B:
+    Type: AWS::EC2::Instance
+    Metadata:
+      Comment: Install Apache & Create HTML File
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              httpd: []
+          files:
+            /var/www/html/index.html:
+              content: |
+                <!DOCTYPE html>
+                <html>
+                  <head>
+                    <meta charset="utf-8">
+                  </head>
+                  <body>
+                    <p>EC2B</p>
+                  </body>
+                </html>
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+    Properties:
+      ImageId: !FindInMap [RegionAndAMIID, !Ref "AWS::Region", !Ref EnvironmentType]
+      InstanceType: !FindInMap [RegionAndInstanceType, !Ref "AWS::Region", !Ref EnvironmentType]
+      KeyName: !Ref KeyName
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: false
+          GroupSet: 
+            - !Ref InstanceSecurityGroup2
+          DeviceIndex: 0
+          SubnetId: !Ref PrivateSubnet1
+          PrivateIpAddress: 10.100.100.5
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          sed -i.old -e 's/#Port 22/Port 51512/g' /etc/ssh/sshd_config
+          systemctl restart sshd
+
+          /opt/aws/bin/cfn-init -v \
+          --stack ${AWS::StackName} \
+          --resource EC2B \
+          --region ${AWS::Region}
+
+          /opt/aws/bin/cfn-signal -e $? \
+          --stack ${AWS::StackName} \
+          --resource EC2B \
+          --region ${AWS::Region}
+
+          sed -i.old -e "s/#ServerName www.example.com:80/ServerName www.example.com:80/g" /etc/httpd/conf/httpd.conf
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+
+
+# EC2C Create
+  EC2C:
+    Type: AWS::EC2::Instance
+    Metadata:
+      Comment: Install Apache & Create HTML File
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              httpd: []
+          files:
+            /var/www/html/index.html:
+              content: |
+                <!DOCTYPE html>
+                <html>
+                  <head>
+                    <meta charset="utf-8">
+                  </head>
+                  <body>
+                    <p>EC2C</p>
+                  </body>
+                </html>
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+    Properties:
+      ImageId: !FindInMap [RegionAndAMIID, !Ref "AWS::Region", !Ref EnvironmentType]
+      InstanceType: !FindInMap [RegionAndInstanceType, !Ref "AWS::Region", !Ref EnvironmentType]
+      KeyName: !Ref KeyName
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: false
+          GroupSet: 
+            - !Ref InstanceSecurityGroup2
+          DeviceIndex: 0
+          SubnetId: !Ref PrivateSubnet1
+          PrivateIpAddress: 10.100.100.6
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          sed -i.old -e 's/#Port 22/Port 51512/g' /etc/ssh/sshd_config
+          systemctl restart sshd
+
+          /opt/aws/bin/cfn-init -v \
+          --stack ${AWS::StackName} \
+          --resource EC2C \
+          --region ${AWS::Region}
+          
+          /opt/aws/bin/cfn-signal -e $? \
+          --stack ${AWS::StackName} \
+          --resource EC2C \
+          --region ${AWS::Region}
+
+          sed -i.old -e "s/#ServerName www.example.com:80/ServerName www.example.com:80/g" /etc/httpd/conf/httpd.conf
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+
+
+# EC2D Create
+  EC2D:
+    Type: AWS::EC2::Instance
+    Metadata:
+      Comment: Install Apache & Create HTML File
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              httpd: []
+          files:
+            /var/www/html/index.html:
+              content: |
+                <!DOCTYPE html>
+                <html>
+                  <head>
+                    <meta charset="utf-8">
+                  </head>
+                  <body>
+                    <p>EC2D</p>
+                  </body>
+                </html>
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+    Properties:
+      ImageId: !FindInMap [RegionAndAMIID, !Ref "AWS::Region", !Ref EnvironmentType]
+      InstanceType: !FindInMap [RegionAndInstanceType, !Ref "AWS::Region", !Ref EnvironmentType]
+      KeyName: !Ref KeyName
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: false
+          GroupSet: 
+            - !Ref InstanceSecurityGroup2
+          DeviceIndex: 0
+          SubnetId: !Ref PrivateSubnet1
+          PrivateIpAddress: 10.100.100.7
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          sed -i.old -e 's/#Port 22/Port 51512/g' /etc/ssh/sshd_config
+          systemctl restart sshd
+          
+          /opt/aws/bin/cfn-init -v \
+          --stack ${AWS::StackName} \
+          --resource EC2D \
+          --region ${AWS::Region}
+
+          /opt/aws/bin/cfn-signal -e $? \
+          --stack ${AWS::StackName} \
+          --resource EC2D \
+          --region ${AWS::Region}
+
+          sed -i.old -e "s/#ServerName www.example.com:80/ServerName www.example.com:80/g" /etc/httpd/conf/httpd.conf
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+         
+
+
+#=========================================================================================
+# SecurityGroup
+#=========================================================================================
+# SecurityGroup1 Create 
+  InstanceSecurityGroup1:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security Group for Bastion
+      SecurityGroupIngress:
+        -
+          IpProtocol: tcp
+          FromPort: 51512
+          ToPort: 51512
+          CidrIp: !Ref ClientIP
+      VpcId: !Ref VPC1
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+
+
+# SecurityGroup2 Create 
+  InstanceSecurityGroup2:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security Group for WEB Server
+      SecurityGroupIngress:
+        -
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup1
+        -
+          IpProtocol: tcp
+          FromPort: 51512
+          ToPort: 51512
+          SourceSecurityGroupId: !Ref InstanceSecurityGroup1
+      VpcId: !Ref VPC1
+      Tags:
+        - Key: Name
+          Value: !FindInMap [RegionAndTagValue, !Ref "AWS::Region", !Ref EnvironmentType]
+
+#=========================================================================================
+# Outputs
+#=========================================================================================
+Outputs:
+  PublicSubnet1:
+    Description: PublicSubnet1
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub ${AWS::StackName}-PublicSubnet1
+
+  PublicIPaddress:
+    Description: PublicIpaddress for Bastion
+    Value: !GetAtt Bastion.PublicIp
+
+  InstanceSecurityGroup1:
+    Description: InstanceSecurityGroup1
+    Value: !Ref InstanceSecurityGroup1
+    Export:
+      Name: !Sub ${AWS::StackName}-InstanceSecurityGroup1
